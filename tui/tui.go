@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"github.com/charmbracelet/bubbles/help"
+	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/gocql/gocql"
 	"log"
@@ -23,6 +24,7 @@ type model struct {
 	help      help.Model
 	details   *Details
 	searchBar *Search
+	tpl       *TablePrintList
 }
 
 type scanMsg struct {
@@ -30,7 +32,7 @@ type scanMsg struct {
 }
 
 // Scan CQL Keyspace for tables, functions, aggregates, views, and user types.
-func (m model) Scan() tea.Cmd {
+func (m *model) Scan() tea.Cmd {
 
 	keys := make([]string, 5)
 	keysCursor := 0
@@ -107,36 +109,105 @@ func initialModel(cqlSession *gocql.Session, keyspace string, prettyPrintJson bo
 		keyspaceMetaData: keyspaceMetaData,
 	}, nil
 }
-func (m model) Init() tea.Cmd {
+func (m *model) Init() tea.Cmd {
 	return m.Scan()
 }
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *model) UpdateSize(width int, height int) {
+	m.tpl.width = width/2 - MARGIN
+	m.details.width = width/2 - MARGIN
+
+	m.tpl.height = height - 7
+	m.details.height = height - 7
+}
+
+func setWindowSize(width int, height int) tea.Cmd {
+	return func() tea.Msg {
+		return tea.WindowSizeMsg{
+			Width:  width,
+			Height: height,
+		}
+	}
+}
+func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	// Is it a key press?
+	case tea.WindowSizeMsg:
+		m.UpdateSize(msg.Width, msg.Height)
+
+	case scanMsg: // new scan results
+		search := strings.ReplaceAll(m.search, "*", "")
+		for _, key := range msg.keys {
+			split := strings.Split(key, ":")
+			m.Node.AddChild(split, key, m.redis, search)
+		}
+		m.tpl.Update(updatePL{&m.Node})
+		m.ScanCursor = msg.cursor
+
+	case setTextMessage:
+		m.reset(msg.text)
+		cmds := tea.Sequence(m.Scan(), m.tpl.ResetCursor)
+		return m, cmds
+
 	case tea.KeyMsg:
+		// if the search bar is active, pass all messages to search
+		if m.search_bar.active {
+			ms, cmd := m.search_bar.Update(msg)
+			m.search_bar = ms.(*Search)
 
-		// Cool, what was the actual key pressed?
-		switch msg.String() {
-
-		// These keys should exit the program.
-		case "ctrl+c", "q":
+			return m, cmd
+		}
+		switch {
+		case key.Matches(msg, default_keys.Quit):
 			return m, tea.Quit
 
-		// The "enter" key and the spacebar (a literal space) toggle
-		// the selected state for the item that the cursor is pointing at.
-		case "enter", " ":
-			_, ok := m.selected[m.cursor]
-			if ok {
-				delete(m.selected, m.cursor)
-			} else {
-				m.selected[m.cursor] = struct{}{}
+		case key.Matches(msg, default_keys.Search):
+			m.search_bar.ToggleActive(true)
+			return m, nil
+
+		case key.Matches(msg, default_keys.Enter):
+			node := m.tpl.GetCurrent()
+			if node != nil && len(node.Children) == 0 {
+				cmd := m.GetDetails(node)
+				return m, cmd
+			} else if node != nil {
+				node.Expanded = !node.Expanded
+				m.tpl.Update(updatePL{&m.Node})
 			}
+
+		case key.Matches(msg, default_keys.Scan):
+			return m, m.Scan()
+
+		case key.Matches(msg, default_keys.Help):
+			m.help.ShowAll = !m.help.ShowAll
+			return m, nil
+
+		case key.Matches(msg, default_keys.Search):
+			m.search_bar.ToggleActive(true)
+			return m, nil
 		}
 	}
 
+	// update the other models on the screen
+	res, cmd := m.tpl.Update(msg)
+	if a, ok := res.(*TablePrintList); ok {
+		m.tpl = a
+	} else {
+		return res, cmd
+	}
+
+	res, cmd = m.search_bar.Update(msg)
+	if a, ok := res.(*Search); ok {
+		m.search_bar = a
+	} else {
+		return res, cmd
+	}
+
+	res, cmd = m.details.Update(msg)
+	if a, ok := res.(*Details); ok {
+		m.details = a
+	}
 	return m, nil
 }
-func (m model) View() string {
+func (m *model) View() string {
 	// The header
 	s := "Welcome to CQL_TUI!\n\n"
 
